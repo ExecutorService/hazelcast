@@ -16,11 +16,11 @@
 
 package com.hazelcast.spi;
 
-import com.hazelcast.nio.Address;
-import com.hazelcast.spi.impl.Response;
-
 import java.util.Collection;
 import java.util.Map;
+
+import com.hazelcast.nio.Address;
+import com.hazelcast.spi.impl.Response;
 
 /**
  * The OperationService is responsible for executing operations.
@@ -133,4 +133,6 @@ public interface OperationService {
      * @return true if send successfully, false otherwise.
      */
     boolean send(Response response, Address target);
+
+    String getResponseStats();
 }

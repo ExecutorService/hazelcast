@@ -16,6 +16,21 @@
 
 package com.hazelcast.spi.impl;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.core.MemberLeftException;
@@ -56,21 +71,6 @@ import com.hazelcast.util.EmptyStatement;
 import com.hazelcast.util.ExceptionUtil;
 import com.hazelcast.util.executor.ExecutorType;
 import com.hazelcast.util.executor.ManagedExecutorService;
-
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static com.hazelcast.instance.OutOfMemoryErrorDispatcher.inspectOutputMemoryError;
 import static com.hazelcast.spi.OperationAccessor.isJoinOperation;
@@ -201,6 +201,11 @@ final class BasicOperationService implements InternalOperationService {
     @Override
     public int getResponseQueueSize() {
         return scheduler.getResponseQueueSize();
+    }
+
+    @Override
+    public String getResponseStats() {
+        return responsePacketHandler.getResponseStats();
     }
 
     @Override
@@ -593,10 +598,56 @@ final class BasicOperationService implements InternalOperationService {
      * Responsible for handling responses.
      */
     private final class ResponsePacketHandler {
+        // Temporary members for diagnostic purposes - see STASHDEV-7788
+        private AtomicLong deserializationTime = new AtomicLong(0L);
+        private AtomicLong responsesProcessed = new AtomicLong(0L);
+        private AtomicLong worstDeserializationTime = new AtomicLong(0L);
+        private Response worstResponse = null;
+
+        public String getResponseStats()
+        {
+            long responsesProcessedValue = responsesProcessed.longValue();
+            long deserializationTimeValue = deserializationTime.longValue();
+            long worstDeserializationTimeValue = worstDeserializationTime.longValue();
+
+            String result = "processed=" + responsesProcessedValue;
+            result += ", time=" + (deserializationTimeValue / 1000000.0) + "ms";
+            result += ", worst=" + (worstDeserializationTimeValue / 1000000.0) + "ms";
+            if (worstResponse != null)
+            {
+                result += " - " + worstResponse.toString();
+            }
+            responsesProcessed.addAndGet(-responsesProcessedValue);
+            deserializationTime.addAndGet(-deserializationTimeValue);
+            if (worstDeserializationTime.compareAndSet(worstDeserializationTimeValue, 0L))
+            {
+                worstResponse = null;
+            }
+            return result;
+        }
+
         private void handle(Packet packet) {
             try {
+                // Temporary code for diagnostic purposes - see STASHDEV-7788
+                final long startTime = System.nanoTime();
+                // End temporary code
+
                 Data data = packet.getData();
                 Response response = (Response) nodeEngine.toObject(data);
+
+                // Temporary code for diagnostic purposes - see STASHDEV-7788
+                final long time = System.nanoTime() - startTime;
+                responsesProcessed.incrementAndGet();
+                deserializationTime.addAndGet(time);
+                long worstDeserializationTimeValue;
+                while ((worstDeserializationTimeValue = worstDeserializationTime.longValue()) < time)
+                {
+                    if (worstDeserializationTime.compareAndSet(worstDeserializationTimeValue, time))
+                    {
+                        worstResponse = response;
+                    }
+                }
+                // End temporary code
 
                 if (response instanceof NormalResponse || response instanceof CallTimeoutResponse) {
                     notifyRemoteCall(response);
