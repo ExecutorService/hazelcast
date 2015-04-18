@@ -16,6 +16,15 @@
 
 package com.hazelcast.spi.impl;
 
+import java.util.Queue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+
 import com.hazelcast.core.PartitionAware;
 import com.hazelcast.instance.Node;
 import com.hazelcast.logging.ILogger;
@@ -26,15 +35,6 @@ import com.hazelcast.spi.Operation;
 import com.hazelcast.spi.PartitionAwareOperation;
 import com.hazelcast.spi.UrgentSystemOperation;
 import com.hazelcast.util.executor.HazelcastManagedThread;
-
-import java.util.Queue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
 
 import static com.hazelcast.instance.OutOfMemoryErrorDispatcher.inspectOutputMemoryError;
 
@@ -79,7 +79,8 @@ public final class BasicOperationScheduler {
     private final BlockingQueue genericWorkQueue = new LinkedBlockingQueue();
     private final ConcurrentLinkedQueue genericPriorityWorkQueue = new ConcurrentLinkedQueue();
 
-    private final ResponseThread responseThread;
+    private final ResponseThread[] responseThreads;
+    private final BlockingQueue<Packet> responseWorkQueue = new LinkedBlockingQueue<Packet>();
 
     private volatile boolean shutdown;
 
@@ -111,12 +112,23 @@ public final class BasicOperationScheduler {
         this.partitionOperationThreads = new OperationThread[getPartitionOperationThreadCount()];
         initOperationThreads(partitionOperationThreads, new PartitionOperationThreadFactory());
 
-        this.responseThread = new ResponseThread();
-        responseThread.start();
+        this.responseThreads = new ResponseThread[getResponseThreadCount()];
+
+        initResponseThreads(responseThreads, new ResponseThreadFactory());
 
         logger.info("Starting with " + genericOperationThreads.length + " generic operation threads and "
                 + partitionOperationThreads.length + " partition operation threads.");
     }
+
+    @edu.umd.cs.findbugs.annotations.SuppressWarnings({ "NP_NONNULL_PARAM_VIOLATION" })
+    private static void initResponseThreads(ResponseThread[] responseThreads, ThreadFactory threadFactory) {
+            for (int threadId = 0; threadId < responseThreads.length; threadId++) {
+                ResponseThread responseThread = (ResponseThread) threadFactory.newThread(null);
+                responseThreads[threadId] = responseThread;
+                responseThread.start();
+            }
+        }
+
 
     @edu.umd.cs.findbugs.annotations.SuppressWarnings({"NP_NONNULL_PARAM_VIOLATION" })
     private static void initOperationThreads(OperationThread[] operationThreads, ThreadFactory threadFactory) {
@@ -143,6 +155,15 @@ public final class BasicOperationScheduler {
             // default partition operation thread count
             int coreSize = Runtime.getRuntime().availableProcessors();
             threadCount = Math.max(2, coreSize);
+        }
+        return threadCount;
+    }
+
+    private int getResponseThreadCount() {
+        int threadCount = node.getGroupProperties().RESPONSE_THREAD_COUNT.getInteger();
+        if (threadCount <= 0) {
+            int coreSize = Runtime.getRuntime().availableProcessors();
+            threadCount = coreSize * 2;
         }
         return threadCount;
     }
@@ -236,7 +257,7 @@ public final class BasicOperationScheduler {
     }
 
     public int getResponseQueueSize() {
-        return responseThread.workQueue.size();
+        return responseWorkQueue.size();
     }
 
     public void execute(Operation op) {
@@ -274,7 +295,7 @@ public final class BasicOperationScheduler {
         try {
             if (packet.isHeaderSet(Packet.HEADER_RESPONSE)) {
                 //it is an response packet.
-                responseThread.workQueue.add(packet);
+                responseWorkQueue.add(packet);
             } else {
                 //it is an must be an operation packet
                 int partitionId = packet.getPartitionId();
@@ -372,9 +393,13 @@ public final class BasicOperationScheduler {
             sb.append(operationThread.getName())
                     .append(" processedCount=").append(operationThread.processedCount).append('\n');
         }
-        sb.append(responseThread.getName())
-                .append(" processedCount: ").append(responseThread.processedResponses)
-                .append(" pendingCount: ").append(responseThread.workQueue.size()).append('\n');
+
+        for(int k=0; k < responseThreads.length; k++) {
+            sb.append(responseThreads[k].getName())
+            .append(" processedCount: ").append(responseThreads[k].processedResponses)
+            .append(" pendingCount: ").append(responseWorkQueue.size()).append('\n');
+        }
+
     }
 
     private class GenericOperationThreadFactory implements ThreadFactory {
@@ -404,6 +429,18 @@ public final class BasicOperationScheduler {
             threadId++;
             return thread;
         }
+    }
+
+    private class ResponseThreadFactory implements ThreadFactory {
+        private int threadId;
+
+        @Override
+        public Thread newThread(Runnable ignore) {
+                String threadName = node.getThreadPoolNamePrefix("response") + threadId;
+                ResponseThread thread = new ResponseThread(threadName);
+                threadId++;
+                return thread;
+            }
     }
 
     final class OperationThread extends HazelcastManagedThread {
@@ -487,12 +524,10 @@ public final class BasicOperationScheduler {
     }
 
     private class ResponseThread extends Thread {
-        private final BlockingQueue<Packet> workQueue = new LinkedBlockingQueue<Packet>();
         // field is only written by the response-thread itself, but can be read by other threads.
         private volatile long processedResponses;
-
-        public ResponseThread() {
-            super(node.threadGroup, node.getThreadNamePrefix("response"));
+        public ResponseThread(String threadName) {
+            super(node.threadGroup, threadName);
             setContextClassLoader(node.getConfigClassLoader());
         }
 
@@ -509,7 +544,7 @@ public final class BasicOperationScheduler {
             for (;;) {
                 Object task;
                 try {
-                    task = workQueue.take();
+                    task = responseWorkQueue.take();
                 } catch (InterruptedException e) {
                     if (shutdown) {
                         return;
